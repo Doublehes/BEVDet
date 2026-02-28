@@ -295,7 +295,6 @@ class LSSViewTransformer(BaseModule):
 
     def view_transform_core(self, input, depth, tran_feat):
         B, N, C, H, W = input[0].shape
-
         # Lift-Splat
         if self.accelerate:
             feat = tran_feat.view(B, N, self.out_channels, H, W)
