@@ -216,9 +216,12 @@ def main():
                 check_point_in_img(corners_img, img.shape[0], img.shape[1]))
             valid = valid.reshape(-1, 8)
             corners_img = corners_img.reshape(-1, 8, 2).astype(np.int)
+            # import pudb;pudb.set_trace()
             for aid in range(valid.shape[0]):
                 for index in draw_boxes_indexes_img_view:
                     if valid[aid, index[0]] and valid[aid, index[1]]:
+                        if scores[aid] < args.vis_thred:
+                            continue
                         cv2.line(
                             img,
                             corners_img[aid, index[0]],
