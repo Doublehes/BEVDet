@@ -14,6 +14,54 @@ from ..builder import NECKS
 from .spatial_cross_attention import SpatialCrossAttention
 
 
+class FFN(BaseModule):
+    def __init__(self, d_model: int, d_ffn: int, drop_prob: float = 0.1):
+        super().__init__()
+        # FFN核心层
+        self.linear1 = nn.Linear(d_model, d_ffn)  # 升维：d_model -> d_ffn
+        self.activation = F.relu  # ReLU激活函数
+        self.dropout2 = nn.Dropout(drop_prob)     # 激活后的Dropout
+        self.linear2 = nn.Linear(d_ffn, d_model)  # 降维：d_ffn -> d_model
+        self.dropout3 = nn.Dropout(drop_prob)     # 残差相加前的Dropout
+        self.norm2 = nn.LayerNorm(d_model)        # 层归一化
+
+    def forward(self, src):
+        # 1. FFN核心计算：线性1 -> ReLU -> Dropout2 -> 线性2
+        src2 = self.linear2(self.dropout2(self.activation(self.linear1(src))))
+        # 2. 残差连接：原始输入 + FFN输出（先Dropout3）
+        src = src + self.dropout3(src2)
+        # 3. 层归一化（Post-LN模式，Transformer原论文方案）
+        src = self.norm2(src)
+        return src
+
+
+class AttentionLayer(BaseModule):
+    def __init__(self, embed_dims, num_cams, deformable_attention):
+        super(AttentionLayer, self).__init__()
+        self.embed_dims = embed_dims
+        self.num_cams = num_cams
+        self.deformable_attention = SpatialCrossAttention(
+            embed_dims=embed_dims,
+            num_cams=num_cams,
+            deformable_attention=deformable_attention)
+        self.norm = nn.LayerNorm(embed_dims)
+        self.ffn = FFN(embed_dims, embed_dims * 4, drop_prob=0.1)
+
+    def forward(self, query, key, value, spatial_shapes, level_start_index,
+                reference_points_cam, bev_mask):
+        output = self.deformable_attention(
+            query=query,
+            key=key,
+            value=value,
+            spatial_shapes=spatial_shapes,
+            level_start_index=level_start_index,
+            reference_points_cam=reference_points_cam,
+            bev_mask=bev_mask)
+        output = self.norm(output)
+        output = self.ffn(output)
+        return output
+
+
 @NECKS.register_module()
 class BEVFormerViewTransformer(BaseModule):
     r"""Lift-Splat-Shoot view transformer with BEVPoolv2 implementation.
@@ -70,11 +118,15 @@ class BEVFormerViewTransformer(BaseModule):
             nn.ReLU(inplace=True)
         )
 
-        self.attn = SpatialCrossAttention(embed_dims=out_channels, num_cams=6, 
-                                deformable_attention=dict(type='MSDeformableAttention3D',
-                                                          embed_dims=out_channels,
-                                                          num_points=8,
-                                                          num_levels=1))
+        self.n_layers = 3
+        self.bev_layers = nn.ModuleList([
+            AttentionLayer(embed_dims=out_channels, num_cams=6,
+                           deformable_attention=dict(type='MSDeformableAttention3D',
+                                                     embed_dims=out_channels,
+                                                     num_points=8,
+                                                     num_levels=1))
+            for _ in range(self.n_layers)
+        ])
 
     def get_lidar_coor(self, sensor2ego, ego2global, cam2imgs, post_rots, post_trans,
                        bda):
@@ -279,12 +331,15 @@ class BEVFormerViewTransformer(BaseModule):
         level_start_index = torch.cat((spatial_shapes.new_zeros((1,)), spatial_shapes.prod(1).cumsum(0)[:-1]))
 
         feat_flatten = feat_flatten.permute(0, 2, 1, 3)  # (num_cam, H*W, bs, embed_dims)
-        bev_feat = self.attn(bev_queries, feat_flatten, feat_flatten, 
-                             spatial_shapes=spatial_shapes, 
-                             level_start_index=level_start_index, 
-                             reference_points_cam=reference_points_cam, 
-                             bev_mask=bev_mask)
-        bev_feat = bev_feat.permute(0, 2, 1).view(B, self.out_channels, self.bev_h, self.bev_w)
+
+        for layer in self.bev_layers:
+            bev_queries = layer(bev_queries, feat_flatten, feat_flatten, 
+                                spatial_shapes=spatial_shapes, 
+                                level_start_index=level_start_index, 
+                                reference_points_cam=reference_points_cam, 
+                                bev_mask=bev_mask)
+
+        bev_feat = bev_queries.permute(0, 2, 1).view(B, self.out_channels, self.bev_h, self.bev_w)
         # import pudb;pudb.set_trace()
         return bev_feat, None
 
