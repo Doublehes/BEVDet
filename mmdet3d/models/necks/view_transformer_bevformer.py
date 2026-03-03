@@ -230,14 +230,15 @@ class BEVFormerViewTransformer(BaseModule):
 
         ego2cam = sensor2ego.inverse()
         cam2imgs_new = torch.eye(4, device=cam2imgs.device).view(1, 1, 4, 4).repeat(cam2imgs.shape[0], cam2imgs.shape[1], 1, 1)
-        cam2imgs_new[:, :, :3, :3] = cam2imgs
+        cam2imgs_new[:, :, :3, :3] = cam2imgs[:, :, :3, :3]
         bda_batch = bda.view(bda.shape[0], 1, 4, 4).repeat(1, cam2imgs.shape[1], 1, 1)
         ego2img = cam2imgs_new @ ego2cam @ bda_batch.inverse()
-        post_T = torch.eye(4, device=post_rots.device).view(1, 1, 4, 4).repeat(post_rots.shape[0], post_rots.shape[1], 1, 1)
-        post_T[:, :, :3, :3] = post_rots
-        post_T[:, :, :3, 3] = post_trans
 
-        lidar2img = post_T @ ego2img
+        post_T = post_rots.clone() # (B, N_cam, 3, 3)
+        post_T[:, :, :2, 2] = post_trans[:, :, :2]
+
+        # import pudb;pudb.set_trace()
+        lidar2img = ego2img
 
         reference_points = reference_points.clone()
 
@@ -245,8 +246,7 @@ class BEVFormerViewTransformer(BaseModule):
         reference_points[..., 1:2] = reference_points[..., 1:2] * (self.grid_config['y'][1] - self.grid_config['y'][0]) + self.grid_config['y'][0]
         reference_points[..., 2:3] = reference_points[..., 2:3] * (self.grid_config['z'][1] - self.grid_config['z'][0]) + self.grid_config['z'][0]
 
-        reference_points = torch.cat(
-            (reference_points, torch.ones_like(reference_points[..., :1])), -1)
+        reference_points = torch.cat((reference_points, torch.ones_like(reference_points[..., :1])), -1)
 
         reference_points = reference_points.permute(1, 0, 2, 3)
         D, B, num_query = reference_points.size()[:3]
@@ -255,16 +255,21 @@ class BEVFormerViewTransformer(BaseModule):
         reference_points = reference_points.view(
             D, B, 1, num_query, 4).repeat(1, 1, num_cam, 1, 1).unsqueeze(-1)
 
-        lidar2img = lidar2img.view(
-            1, B, num_cam, 1, 4, 4).repeat(D, 1, 1, num_query, 1, 1)
+        lidar2img = lidar2img.view(1, B, num_cam, 1, 4, 4).repeat(D, 1, 1, num_query, 1, 1)
+        post_T = post_T.view(1, B, num_cam, 1, 3, 3).repeat(D, 1, 1, num_query, 1, 1)
 
         reference_points_cam = torch.matmul(lidar2img.to(torch.float32),
-                                            reference_points.to(torch.float32)).squeeze(-1)
+                                            reference_points.to(torch.float32)).squeeze(-1) 
         eps = 1e-5
-
         bev_mask = (reference_points_cam[..., 2:3] > eps)
         reference_points_cam = reference_points_cam[..., 0:2] / torch.maximum(
             reference_points_cam[..., 2:3], torch.ones_like(reference_points_cam[..., 2:3]) * eps)
+
+        # post
+        reference_points_cam = torch.cat((reference_points_cam, 
+                                          torch.ones_like(reference_points_cam[..., :1])), -1).unsqueeze(-1)
+        reference_points_cam = torch.matmul(post_T.to(torch.float32), reference_points_cam.to(torch.float32)).squeeze(-1)
+        reference_points_cam = reference_points_cam[..., :2]
 
         reference_points_cam[..., 0] /= img_w
         reference_points_cam[..., 1] /= img_h
@@ -315,6 +320,21 @@ class BEVFormerViewTransformer(BaseModule):
         ref_3d = self.get_reference_points(self.bev_h, self.bev_w, 8, 4, 
                                            dim='3d', bs=B,  device=x.device, dtype=x.dtype)
         reference_points_cam, bev_mask = self.point_sampling(ref_3d, input[1:7], img_h, img_w)
+
+        # import pudb;pudb.set_trace()
+        # import cv2
+        # for i_cam in range(N):
+        #     for z_i in range(reference_points_cam.shape[3]):
+        #         refer_cam_points = reference_points_cam[i_cam, 0, :, z_i][bev_mask[i_cam, 0, :, z_i]]
+        #         refer_cam_points = refer_cam_points * torch.tensor([img_w, img_h], device=x.device)
+        #         refer_cam_points = refer_cam_points.long()
+        #         points = refer_cam_points.cpu().numpy()
+        #         empty_img = np.zeros((img_h, img_w, 3), dtype=np.uint8)
+        #         for (u, v) in points:
+        #             center = (int(u), int(v))
+        #             cv2.circle(empty_img, center, 1, (0, 255, 0), -1)
+        #         cv2.imwrite(f'refer_cam_points_cam{i_cam}_z{z_i}.png', empty_img)
+        #         print(f"saving refer_cam_points_cam{i_cam}_z{z_i}.png")
     
         feat_flatten = []
         spatial_shapes = []

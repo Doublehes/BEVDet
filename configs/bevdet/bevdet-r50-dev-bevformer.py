@@ -45,7 +45,7 @@ data_config = {
     # Augmentation
     'resize': (-0.06, 0.11),
     'rot': (-5.4, 5.4),
-    'flip': True,
+    'flip': False,
     'crop_h': (0.0, 0.0),
     'resize_test': 0.00,
 }
@@ -180,7 +180,8 @@ train_pipeline = [
     dict(
         type='BEVAug',
         bda_aug_conf=bda_aug_conf,
-        classes=class_names),
+        classes=class_names,
+        is_train=False),
     dict(type='ObjectRangeFilter', point_cloud_range=point_cloud_range),
     dict(type='ObjectNameFilter', classes=class_names),
     dict(type='DefaultFormatBundle3D', class_names=class_names),
