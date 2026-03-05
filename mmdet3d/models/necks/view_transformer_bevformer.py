@@ -2,17 +2,15 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from mmcv.cnn import build_conv_layer
 from mmcv.runner import BaseModule, force_fp32
 from mmcv.utils import TORCH_VERSION, digit_version
-from torch.cuda.amp.autocast_mode import autocast
-from torch.utils.checkpoint import checkpoint
+from mmcv.cnn.bricks.transformer import build_positional_encoding
 import numpy as np
 
 from ..builder import NECKS
 
 from .spatial_cross_attention import SpatialCrossAttention
-
+from .temporal_self_attention import TemporalSelfAttention
 
 class FFN(BaseModule):
     def __init__(self, d_model: int, d_ffn: int, drop_prob: float = 0.1):
@@ -30,7 +28,6 @@ class FFN(BaseModule):
         src2 = self.linear2(self.dropout2(self.activation(self.linear1(src))))
         # 2. 残差连接：原始输入 + FFN输出（先Dropout3）
         src = src + self.dropout3(src2)
-        # 3. 层归一化（Post-LN模式，Transformer原论文方案）
         src = self.norm2(src)
         return src
 
@@ -40,16 +37,33 @@ class AttentionLayer(BaseModule):
         super(AttentionLayer, self).__init__()
         self.embed_dims = embed_dims
         self.num_cams = num_cams
-        self.deformable_attention = SpatialCrossAttention(
+        self.cross_attn = SpatialCrossAttention(
             embed_dims=embed_dims,
             num_cams=num_cams,
             deformable_attention=deformable_attention)
-        self.norm = nn.LayerNorm(embed_dims)
-        self.ffn = FFN(embed_dims, embed_dims * 4, drop_prob=0.1)
+        self.norm_cross_attn = nn.LayerNorm(embed_dims)
+        
+        self.self_attn = TemporalSelfAttention(embed_dims=embed_dims, num_levels=1, num_bev_queue=1)
+        self.norm_self_attn = nn.LayerNorm(embed_dims)
 
-    def forward(self, query, key, value, spatial_shapes, level_start_index,
-                reference_points_cam, bev_mask):
-        output = self.deformable_attention(
+        self.ffn = FFN(embed_dims, embed_dims * 4, drop_prob=0.1)
+        self.norm_ffn = nn.LayerNorm(embed_dims)
+
+    def forward(self, query, key, value, 
+                bev_pos, ref_2d, bev_h, bev_w,
+                spatial_shapes, level_start_index, reference_points_cam, bev_mask):
+        output = self.self_attn(
+            query=query,
+            key=query,
+            value=query,
+            query_pos=bev_pos,
+            key_pos=bev_pos,
+            reference_points=ref_2d,
+            spatial_shapes=torch.tensor([[bev_h, bev_w]], device=query.device),
+            level_start_index=torch.tensor([0], device=query.device))
+        output = self.norm_self_attn(output)
+
+        output = self.cross_attn(
             query=query,
             key=key,
             value=value,
@@ -57,8 +71,10 @@ class AttentionLayer(BaseModule):
             level_start_index=level_start_index,
             reference_points_cam=reference_points_cam,
             bev_mask=bev_mask)
-        output = self.norm(output)
+        output = self.norm_cross_attn(output)
+
         output = self.ffn(output)
+        output = self.norm_ffn(output)
         return output
 
 
@@ -127,6 +143,13 @@ class BEVFormerViewTransformer(BaseModule):
                                                      num_levels=1))
             for _ in range(self.n_layers)
         ])
+        positional_encoding=dict(
+            type='LearnedPositionalEncoding',
+            num_feats=out_channels // 2,
+            row_num_embed=self.bev_h,
+            col_num_embed=self.bev_w,
+        )
+        self.bev_positional_encoding = build_positional_encoding(positional_encoding)
 
     def get_lidar_coor(self, sensor2ego, ego2global, cam2imgs, post_rots, post_trans,
                        bda):
@@ -310,15 +333,18 @@ class BEVFormerViewTransformer(BaseModule):
         x = x.view(B, N, self.out_channels, H, W)
 
 
-        downsample_factor = 16
+        downsample_factor = self.downsample
         img_h, img_w = downsample_factor * H, downsample_factor * W
 
         # import pudb;pudb.set_trace()
 
         bev_queries = self.bev_embedding.weight.to(x.dtype)
         bev_queries = bev_queries.unsqueeze(0).repeat(B, 1, 1)  # (B, bev_h*bev_w, embed_dims)
-        ref_3d = self.get_reference_points(self.bev_h, self.bev_w, 8, 4, 
-                                           dim='3d', bs=B,  device=x.device, dtype=x.dtype)
+        bev_mask_temp = torch.zeros((B, self.bev_h, self.bev_w),device=bev_queries.device).to(x.dtype)
+        bev_pos = self.bev_positional_encoding(bev_mask_temp).to(x.dtype)
+        bev_pos = bev_pos.flatten(2).permute(0, 2, 1)  # (B, bev_h*bev_w, embed_dims)
+        ref_2d = self.get_reference_points(self.bev_h, self.bev_w, 8, 4, dim='2d', bs=B, device=x.device, dtype=x.dtype)
+        ref_3d = self.get_reference_points(self.bev_h, self.bev_w, 8, 4, dim='3d', bs=B, device=x.device, dtype=x.dtype)
         reference_points_cam, bev_mask = self.point_sampling(ref_3d, input[1:7], img_h, img_w)
 
         # import pudb;pudb.set_trace()
@@ -354,10 +380,15 @@ class BEVFormerViewTransformer(BaseModule):
 
         for layer in self.bev_layers:
             bev_queries = layer(bev_queries, feat_flatten, feat_flatten, 
+                                bev_pos=bev_pos,
+                                ref_2d=ref_2d,
+                                bev_h=self.bev_h,
+                                bev_w=self.bev_w,
                                 spatial_shapes=spatial_shapes, 
                                 level_start_index=level_start_index, 
                                 reference_points_cam=reference_points_cam, 
-                                bev_mask=bev_mask)
+                                bev_mask=bev_mask,
+                                )
 
         bev_feat = bev_queries.permute(0, 2, 1).view(B, self.out_channels, self.bev_h, self.bev_w)
         # import pudb;pudb.set_trace()
