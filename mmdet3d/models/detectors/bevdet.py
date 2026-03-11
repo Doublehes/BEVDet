@@ -216,6 +216,28 @@ class BEVDet(CenterPoint):
 
 
 @DETECTORS.register_module()
+class BEVDetFormer(BEVDet):
+    def __init__(self, img_view_transformer, img_bev_encoder_backbone=None, img_bev_encoder_neck=None, use_grid_mask=False, **kwargs):
+        super().__init__(img_view_transformer, img_bev_encoder_backbone, img_bev_encoder_neck, use_grid_mask, **kwargs)
+
+    def image_encoder(self, img):
+        imgs = img
+        B, N, C, imH, imW = imgs.shape
+        imgs = imgs.view(B * N, C, imH, imW)
+        if self.grid_mask is not None:
+            imgs = self.grid_mask(imgs)
+        x = self.img_backbone(imgs)
+        if self.with_img_neck:
+            x = self.img_neck(x)
+        res = []
+        for feat in x:
+            _, output_dim, ouput_H, output_W = feat.shape
+            feat = feat.view(B, N, output_dim, ouput_H, output_W)
+            res.append(feat)
+        return res, None
+
+
+@DETECTORS.register_module()
 class BEVDetTRT(BEVDet):
 
     def result_serialize(self, outs):

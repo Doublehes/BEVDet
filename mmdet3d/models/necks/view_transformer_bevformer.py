@@ -107,22 +107,19 @@ class BEVFormerViewTransformer(BaseModule):
         self,
         grid_config,
         input_size,
-        downsample=16,
         in_channels=512,
         out_channels=64,
-        accelerate=False,
-        sid=False,
-        collapse_z=True,
         with_cp=False,
-        with_depth_from_lidar=False,
+        num_layer=1
+
     ):
         super(BEVFormerViewTransformer, self).__init__()
         self.with_cp = with_cp
         self.grid_config = grid_config
-        self.downsample = downsample
         self.out_channels = out_channels
         self.in_channels = in_channels
         self.initial_flag = True
+        self.input_size = input_size
 
         self.bev_h = int((grid_config['y'][1] - grid_config['y'][0]) / grid_config['y'][2])
         self.bev_w = int((grid_config['x'][1] - grid_config['x'][0]) / grid_config['x'][2])
@@ -134,14 +131,13 @@ class BEVFormerViewTransformer(BaseModule):
             nn.ReLU(inplace=True)
         )
 
-        self.n_layers = 3
         self.bev_layers = nn.ModuleList([
             AttentionLayer(embed_dims=out_channels, num_cams=6,
                            deformable_attention=dict(type='MSDeformableAttention3D',
                                                      embed_dims=out_channels,
                                                      num_points=8,
                                                      num_levels=1))
-            for _ in range(self.n_layers)
+            for _ in range(num_layer)
         ])
         positional_encoding=dict(
             type='LearnedPositionalEncoding',
@@ -326,26 +322,25 @@ class BEVFormerViewTransformer(BaseModule):
         Returns:
             torch.tensor: Bird-eye-view feature in shape (B, C, H_BEV, W_BEV)
         """
-        x = input[0]
-        B, N, C, H, W = x.shape
-        x = x.view(B * N, C, H, W)
-        x = self.channel_mapper(x)
-        x = x.view(B, N, self.out_channels, H, W)
-
-
-        downsample_factor = self.downsample
-        img_h, img_w = downsample_factor * H, downsample_factor * W
+        mlvl_feats = []
+        for x in input[0]:
+            B, N, C, H, W = x.shape
+            x = x.view(B * N, C, H, W)
+            x = self.channel_mapper(x)
+            x = x.view(B, N, self.out_channels, H, W)
+            mlvl_feats.append(x)
 
         # import pudb;pudb.set_trace()
 
-        bev_queries = self.bev_embedding.weight.to(x.dtype)
+        dtype = mlvl_feats[0].dtype
+        bev_queries = self.bev_embedding.weight.to(dtype)
         bev_queries = bev_queries.unsqueeze(0).repeat(B, 1, 1)  # (B, bev_h*bev_w, embed_dims)
-        bev_mask_temp = torch.zeros((B, self.bev_h, self.bev_w),device=bev_queries.device).to(x.dtype)
-        bev_pos = self.bev_positional_encoding(bev_mask_temp).to(x.dtype)
+        bev_mask_temp = torch.zeros((B, self.bev_h, self.bev_w),device=bev_queries.device).to(dtype)
+        bev_pos = self.bev_positional_encoding(bev_mask_temp).to(dtype)
         bev_pos = bev_pos.flatten(2).permute(0, 2, 1)  # (B, bev_h*bev_w, embed_dims)
-        ref_2d = self.get_reference_points(self.bev_h, self.bev_w, 8, 4, dim='2d', bs=B, device=x.device, dtype=x.dtype)
-        ref_3d = self.get_reference_points(self.bev_h, self.bev_w, 8, 4, dim='3d', bs=B, device=x.device, dtype=x.dtype)
-        reference_points_cam, bev_mask = self.point_sampling(ref_3d, input[1:7], img_h, img_w)
+        ref_2d = self.get_reference_points(self.bev_h, self.bev_w, 8, 4, dim='2d', bs=B, device=x.device, dtype=dtype)
+        ref_3d = self.get_reference_points(self.bev_h, self.bev_w, 8, 4, dim='3d', bs=B, device=x.device, dtype=dtype)
+        reference_points_cam, bev_mask = self.point_sampling(ref_3d, input[1:7], self.input_size[0], self.input_size[1])
 
         # import pudb;pudb.set_trace()
         # import cv2
@@ -364,7 +359,6 @@ class BEVFormerViewTransformer(BaseModule):
     
         feat_flatten = []
         spatial_shapes = []
-        mlvl_feats = [x]
         for lvl, feat in enumerate(mlvl_feats):
             bs, num_cam, c, h, w = feat.shape
             spatial_shape = (h, w)
