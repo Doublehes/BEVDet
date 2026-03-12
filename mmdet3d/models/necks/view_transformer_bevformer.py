@@ -110,8 +110,8 @@ class BEVFormerViewTransformer(BaseModule):
         in_channels=512,
         out_channels=64,
         with_cp=False,
-        num_layer=1
-
+        num_layer=1,
+        num_level=3,
     ):
         super(BEVFormerViewTransformer, self).__init__()
         self.with_cp = with_cp
@@ -136,7 +136,7 @@ class BEVFormerViewTransformer(BaseModule):
                            deformable_attention=dict(type='MSDeformableAttention3D',
                                                      embed_dims=out_channels,
                                                      num_points=8,
-                                                     num_levels=1))
+                                                     num_levels=num_level))
             for _ in range(num_layer)
         ])
         positional_encoding=dict(
