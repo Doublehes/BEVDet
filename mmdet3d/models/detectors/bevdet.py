@@ -236,6 +236,13 @@ class BEVDetFormer(BEVDet):
             res.append(feat)
         return res, None
 
+    def extract_img_feat(self, img, img_metas, **kwargs):
+        """Extract features of images."""
+        img = self.prepare_inputs(img)
+        x, _ = self.image_encoder(img[0])
+        x, depth = self.img_view_transformer([x] + img[1:7])
+        # x = self.bev_encoder(x)
+        return [x], depth
 
 @DETECTORS.register_module()
 class BEVDetTRT(BEVDet):
